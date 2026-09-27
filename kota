@@ -217,14 +217,14 @@ def gpu_types():
 
 
 # ---------------------------------------------------------------- main
-def show_gpu_types():
+def show_gpu_types(titled=True):
     try:
         types = gpu_types()
     except Exception as e:
         print(f"  {red('sacct failed')}: {dim(str(e))}")
         return
     total = sum(h for _, h in types) or 1
-    table(f"GPU hours by type  {dim(f'since {NOW.year}-01-01')}",
+    table(f"GPU hours by type  {dim(f'since {NOW.year}-01-01')}" if titled else None,
           [("GPU", "<"), ("Share", "<"), ("%", ">"), ("Hours", ">")],
           [[t, share_bar(h / total), f"{h / total:.0%}", bold(num(h))] for t, h in types])
 
@@ -272,8 +272,8 @@ def time_left(end):
     return color(bold(f"{d}d {h}h left" if d < 30 else f"{d} days left"))
 
 
-def title_line(*extra):
-    parts = [bold("kota"), bold(USER), f"{NOW:%Y-%m-%d %H:%M}", *extra]
+def title_line(name, *extra):
+    parts = [name, bold(USER), f"{NOW:%Y-%m-%d %H:%M}", *extra]
     print(" " + f" {dim('·')} ".join(parts))
 
 
@@ -290,15 +290,16 @@ def main():
     left = [time_left(end)] if end else []
 
     if args.gpu_types or args.dirs:
-        title_line(*left, *([yellow(CEPH)] if args.dirs else []))
+        name = bold(yellow(CEPH)) if args.dirs else bold(cyan("GPU hours by type"))
+        title_line(name, *left)
         if args.gpu_types:
-            show_gpu_types()
+            show_gpu_types(titled=args.dirs)
         if args.dirs:
             show_dirs()
         return
 
     pace = max(0.0, min((NOW - lo) / (hi - lo), 1.0))
-    title_line(*left)
+    title_line(bold(cyan("Quotas")), *left)
 
     rows = []
     try:
@@ -330,7 +331,7 @@ def main():
     while rows and rows[-1] is None:
         rows.pop()
     if rows:
-        table("Quotas", [("Resource", "<"), ("Usage", "<"), ("%", ">"), ("Used", ">"),
+        table(None, [("Resource", "<"), ("Usage", "<"), ("%", ">"), ("Used", ">"),
                          ("Limit", ">"), ("Left", ">")], rows)
 
 if __name__ == "__main__":

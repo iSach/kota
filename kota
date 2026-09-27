@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""kota: Flatiron quota & usage at a glance.
+
+CPU/GPU hours and ceph storage come from the same Prometheus source as the
+FIDO usage website (and `fi-usage`), so they may lag up to ~1 hour. Ceph
+per-directory sizes and home quota are read live from the filesystems.
+
+  kota        quotas
+  kota -g     GPU hours by GPU type (one sacct query)
+  kota -d     size and file count of each ceph directory
+
+An optional start/end date (e.g. an internship) in ~/.config/kota/config
+shows the time left and sets the pace marker on the hour bars:
+
+  [kota]
+  start = 2026-05-14
+  end = 2026-10-02
+"""
+import argparse
+import colorsys
+import configparser
+import datetime
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+USER = getpass.getuser()
+NOW = datetime.datetime.now()
+PROM = "https://prometheus.flatironinstitute.org/api/v1/query"
+CEPH = f"/mnt/ceph/users/{USER}"
+HOME = f"/mnt/home/{USER}"
+CLUSTERS = {"rusty": "ceph", "popeye": "sdceph"}  # cluster -> storage fs label
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                      "kota", "config")
+BAR_W = 26
+
+# ---------------------------------------------------------------- styling
+COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def sgr(code):
+    return (lambda s: f"\033[{code}m{s}\033[0m") if COLOR else (lambda s: s)
+
+
+bold, dim, red, yellow, green, cyan, magenta = map(sgr, ("1", "2", "91", "93", "92", "96", "95"))
+
+
+def rgb(hue, light=0.5, sat=0.85):
+    r, g, b = (round(c * 255) for c in colorsys.hls_to_rgb(hue / 360, light, sat))
+    return sgr(f"38;2;{r};{g};{b}")
+
+
+def heat(x):
+    """green -> yellow -> red as x goes 0 -> 1."""
+    return rgb(120 * (1 - max(0.0, min(x, 1.0))))
+
+
+def cool(x):
+    """cyan -> violet as x goes 0 -> 1."""
+    return rgb(185 + 90 * max(0.0, min(x, 1.0)), light=0.6)
+
+
+def bar(frac, pace=None, width=BAR_W, ramp=heat):
+    """Smooth unicode bar, each cell colored by its position along `ramp`.
+    Optional `pace` marker shows the year-elapsed point."""
+    frac = max(0.0, min(frac, 1.0))
+    full, part = divmod(round(frac * width * 8), 8)
+    cells = ["█"] * full + (["▏▎▍▌▋▊▉"[part - 1]] if part else [])
+    filled = len(cells)
+    mark = None if pace is None else min(int(pace * width), width - 1)
+    out = []
+    for i in range(width):
+        if i == mark:
+            out.append(bold(magenta("┃")))
+        elif i < filled:
+            out.append(ramp((i + 0.5) / width)(cells[i]))
+        else:
+            out.append(dim("·"))
+    return "".join(out)
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def table(title, heads, rows):
+    """Box-drawn table. `heads` is [(name, align)], a row of None is a separator."""
+    widths = [max([vlen(h)] + [vlen(r[i]) for r in rows if r]) for i, (h, _) in enumerate(heads)]
+
+    def cell(s, i):
+        pad = " " * (widths[i] - vlen(s))
+        return f" {pad}{s} " if heads[i][1] == ">" else f" {s}{pad} "
+
+    def rule(l, m, r):
+        return dim(l + m.join("─" * (w + 2) for w in widths) + r)
+
+    v = dim("│")
+    if title:
+        print(f" {bold(cyan(title))}")
+    print(rule("┌", "┬", "┐"))
+    print(v + v.join(cell(bold(h), i) for i, (h, _) in enumerate(heads)) + v)
+    print(rule("├", "┼", "┤"))
+    for r in rows:
+        print(rule("├", "┼", "┤") if r is None else v + v.join(cell(c, i) for i, c in enumerate(r)) + v)
+    print(rule("└", "┴", "┘"))
+
+
+def share_bar(x, width=16):
+    return bar(x, width=width, ramp=cool)
+
+
+def sig3(v):
+    return f"{v:.2f}" if abs(v) < 10 else f"{v:.1f}" if abs(v) < 100 else f"{v:.0f}"
+
+
+def num(n):
+    """3 significant figures with k/M suffix, like the website."""
+    for div, suf in ((1e6, "M"), (1e3, "k")):
+        if abs(n) >= div:
+            return sig3(n / div) + suf
+    return f"{n:.0f}"
+
+
+def size(b, binary=False):
+    base, units = (1024, ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]) if binary \
+        else (1000, ["B", "kB", "MB", "GB", "TB", "PB"])
+    for u in units:
+        if abs(b) < base or u == units[-1]:
+            return f"{b:.0f} {u}" if u == "B" else f"{sig3(b)} {u}"
+        b /= base
+
+
+def quota_row(label, used, total, fmt, pace=None):
+    frac = used / total if total else (1.0 if used else 0.0)
+    left = total - used
+    return [label, bar(frac, pace), heat(frac)(bold(f"{frac:.0%}")), bold(fmt(used)), fmt(total),
+            red(f"{fmt(-left)} over") if left < 0 else fmt(left)]
+
+
+# ---------------------------------------------------------------- data
+def prom(query):
+    jan2 = datetime.datetime(NOW.year, 1, 2)
+    lb = min(datetime.timedelta(days=7), max(NOW - jan2, datetime.timedelta(minutes=90)))
+    q = urllib.parse.urlencode({"timeout": 5, "query": query,
+                                "lookback_delta": f"{int(lb.total_seconds())}s"})
+    with urllib.request.urlopen(f"{PROM}?{q}", timeout=7) as r:
+        return json.load(r)["data"]["result"]
+
+
+def by(results, key, mapping=None):
+    """Sum results into {label: value} keyed on a metric label."""
+    out = {}
+    for res in results:
+        k = res["metric"].get(key)
+        k = (mapping or {}).get(k, k)
+        out[k] = out.get(k, 0) + float(res["value"][1])
+    return out
+
+
+def fetch_usage():
+    def planned(m):
+        return by(prom(f"users_planned_{m}{{user='{USER}',year_offset='0'}}"), "cluster")
+
+    slurm = prom(f"max by (cluster, tres) (slurm_report_user_usage_seconds{{user='{USER}'}})")
+    compute = {}
+    for res in slurm:
+        c = res["metric"].get("cluster")
+        c = "rusty" if c == "iron" else c
+        compute[(c, res["metric"].get("tres"))] = float(res["value"][1]) / 3600
+    fs2cluster = {v: k for k, v in CLUSTERS.items()}
+    return {
+        "cpu": ({c: compute.get((c, "cpu"), 0) for c in CLUSTERS}, planned("cpu_hours")),
+        "gpu": ({c: compute.get((c, "gres/gpu"), 0) for c in CLUSTERS}, planned("gpu_hours")),
+        "bytes": (by(prom(f"users_usage_bytes{{user='{USER}'}}"), "filesystem", fs2cluster),
+                  {k: v * 1e9 for k, v in planned("store_gb").items()}),
+        "files": (by(prom(f"users_usage_files{{user='{USER}'}}"), "filesystem", fs2cluster),
+                  planned("store_files")),
+    }
+
+
+def ceph_dirs(root):
+    def xattr(p, a):
+        return int(os.getxattr(p, f"ceph.dir.{a}"))
+
+    out = []
+    for e in os.scandir(root):
+        if e.is_dir(follow_symlinks=False):
+            try:
+                out.append((e.name, xattr(e.path, "rbytes"),
+                            xattr(e.path, "rfiles") + xattr(e.path, "rsubdirs") + 1))
+            except OSError:
+                pass
+    return sorted(out, key=lambda t: -t[1])
+
+
+def gpu_types():
+    out = subprocess.run(
+        ["sacct", "-u", USER, "-X", "-S", f"{NOW.year}-01-01", "-E", "now", "-n", "-P",
+         "--format=ElapsedRaw,AllocTRES"],
+        capture_output=True, text=True, check=True, timeout=60).stdout
+    hours = {}
+    for line in out.splitlines():
+        elapsed, tres = line.split("|", 1)
+        m = re.search(r"gres/gpu=(\d+)", tres)
+        if not m:
+            continue
+        typed = re.findall(r"gres/gpu:([^=,]+)=(\d+)", tres) or [("untyped", m.group(1))]
+        for t, n in typed:
+            hours[t] = hours.get(t, 0) + int(n) * int(elapsed or 0) / 3600
+    return sorted(hours.items(), key=lambda kv: -kv[1])
+
+
+# ---------------------------------------------------------------- main
+def show_gpu_types():
+    try:
+        types = gpu_types()
+    except Exception as e:
+        print(f"  {red('sacct failed')}: {dim(str(e))}")
+        return
+    total = sum(h for _, h in types) or 1
+    table(f"GPU hours by type  {dim(f'since {NOW.year}-01-01')}",
+          [("GPU", "<"), ("Share", "<"), ("%", ">"), ("Hours", ">")],
+          [[t, share_bar(h / total), f"{h / total:.0%}", bold(num(h))] for t, h in types])
+
+
+def show_dirs():
+    if not os.path.isdir(CEPH):
+        print(f"  {red('no ceph directory')}: {dim(CEPH)}")
+        return
+    dirs = ceph_dirs(CEPH)
+    total = sum(b for _, b, _ in dirs) or 1
+    table(None,
+          [("Directory", "<"), ("Share of space", "<"), ("%", ">"), ("Size", ">"), ("Files", ">")],
+          [[name + "/", share_bar(b / total), f"{b / total:.0%}", bold(size(b)), num(f)]
+           for name, b, f in dirs])
+
+
+def load_period():
+    """(pace start, pace end, account end) from the config; the end date is inclusive.
+    Hours are counted per calendar year, so the pace window never leaves this year."""
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG)
+    sec = cfg["kota"] if cfg.has_section("kota") else {}
+
+    def date(key):
+        v = sec.get(key, "").strip()
+        try:
+            return datetime.datetime.strptime(v, "%Y-%m-%d") if v else None
+        except ValueError:
+            sys.exit(f"kota: bad {key} date {v!r} in {CONFIG} (want YYYY-MM-DD)")
+
+    start, end = date("start"), date("end")
+    end = end + datetime.timedelta(days=1) if end else None
+    year_start, year_end = datetime.datetime(NOW.year, 1, 1), datetime.datetime(NOW.year + 1, 1, 1)
+    lo = max(year_start, start) if start else year_start
+    hi = min(year_end, end) if end and end > lo else year_end
+    return lo, hi, end
+
+
+def time_left(end):
+    left = end - NOW
+    if left.total_seconds() <= 0:
+        return red("ended")
+    d, h = left.days, left.seconds // 3600
+    color = red if d < 7 else yellow if d < 30 else green
+    return color(bold(f"{d}d {h}h left" if d < 30 else f"{d} days left"))
+
+
+def title_line(*extra):
+    parts = [bold("kota"), bold(USER), f"{NOW:%Y-%m-%d %H:%M}", *extra]
+    print(" " + f" {dim('·')} ".join(parts))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-g", "--gpu-types", action="store_true",
+                    help="GPU hours by GPU type (one sacct query)")
+    ap.add_argument("-d", "--dirs", action="store_true",
+                    help="size and file count of each ceph directory")
+    args = ap.parse_args()
+
+    lo, hi, end = load_period()
+    left = [time_left(end)] if end else []
+
+    if args.gpu_types or args.dirs:
+        title_line(*left, *([yellow(CEPH)] if args.dirs else []))
+        if args.gpu_types:
+            show_gpu_types()
+        if args.dirs:
+            show_dirs()
+        return
+
+    pace = max(0.0, min((NOW - lo) / (hi - lo), 1.0))
+    title_line(*left)
+
+    rows = []
+    try:
+        u = fetch_usage()
+    except Exception as e:  # keep the live filesystem rows useful
+        u = None
+        print(f"  {red('usage server unreachable')}: {dim(str(e))}")
+
+    if u:
+        for cluster in CLUSTERS:
+            if not any(u[k][1].get(cluster) for k in ("cpu", "gpu", "bytes")):
+                continue  # nothing planned on this cluster (e.g. popeye)
+            C = cluster.capitalize()
+            rows += [quota_row(f"{C} CPU hours", u["cpu"][0][cluster], u["cpu"][1].get(cluster, 0), num, pace),
+                     quota_row(f"{C} GPU hours", u["gpu"][0][cluster], u["gpu"][1].get(cluster, 0), num, pace),
+                     None,
+                     quota_row(f"{C} ceph space", u["bytes"][0].get(cluster, 0), u["bytes"][1].get(cluster, 0), size),
+                     quota_row(f"{C} ceph files", u["files"][0].get(cluster, 0), u["files"][1].get(cluster, 0), num),
+                     None]
+
+    try:
+        st = os.statvfs(HOME)
+        rows += [quota_row("Home space", (st.f_blocks - st.f_bfree) * st.f_frsize,
+                           st.f_blocks * st.f_frsize, lambda b: size(b, binary=True)),
+                 quota_row("Home files", st.f_files - st.f_ffree, st.f_files, num)]
+    except OSError as e:
+        print(f"  {red('home quota unavailable')}: {dim(str(e))}")
+
+    while rows and rows[-1] is None:
+        rows.pop()
+    if rows:
+        table("Quotas", [("Resource", "<"), ("Usage", "<"), ("%", ">"), ("Used", ">"),
+                         ("Limit", ">"), ("Left", ">")], rows)
+
+if __name__ == "__main__":
+    main()
